@@ -1,0 +1,137 @@
+version: "3.9"
+
+# GPU Infrastructure Lab Environment
+# Creates a local Kind cluster with NVIDIA device plugin simulation
+# for learning GPU scheduling, monitoring, and distributed training.
+
+services:
+  # ---------------------------------------------------------------
+  # Kind (Kubernetes-in-Docker) cluster control plane
+  # ---------------------------------------------------------------
+  kind-control-plane:
+    image: kindest/node:v1.29.2
+    container_name: gpu-lab-control-plane
+    hostname: gpu-lab-control-plane
+    privileged: true
+    ports:
+      - "6443:6443"   # Kubernetes API server
+      - "30080:30080" # NodePort for dashboards
+      - "30090:30090" # NodePort for Prometheus
+      - "30030:30030" # NodePort for Grafana
+    environment:
+      - KIND_EXPERIMENTAL_PROVIDER=docker
+    volumes:
+      - kubeconfig:/etc/kubernetes
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - gpu-lab
+
+  # ---------------------------------------------------------------
+  # NVIDIA Device Plugin simulator
+  # Advertises fake nvidia.com/gpu resources so you can practise
+  # scheduling, time-slicing, and MIG without physical GPUs.
+  # ---------------------------------------------------------------
+  nvidia-device-plugin:
+    image: nvidia/k8s-device-plugin:v0.14.3
+    container_name: gpu-lab-device-plugin
+    restart: unless-stopped
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DP_DISABLE_HEALTHCHECKS=xids   # allow simulated GPUs
+    volumes:
+      - /var/lib/kubelet/device-plugins:/var/lib/kubelet/device-plugins
+    depends_on:
+      - kind-control-plane
+    networks:
+      - gpu-lab
+
+  # ---------------------------------------------------------------
+  # GPU metrics exporter (DCGM-exporter simulation)
+  # Exposes Prometheus metrics on :9400/metrics
+  # ---------------------------------------------------------------
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.0-3.2.0-ubuntu22.04
+    container_name: gpu-lab-dcgm-exporter
+    restart: unless-stopped
+    ports:
+      - "9400:9400"
+    environment:
+      - DCGM_EXPORTER_LISTEN=:9400
+      - DCGM_EXPORTER_KUBERNETES=true
+    depends_on:
+      - kind-control-plane
+    networks:
+      - gpu-lab
+
+  # ---------------------------------------------------------------
+  # Prometheus — scrapes GPU and cluster metrics
+  # ---------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.49.1
+    container_name: gpu-lab-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./manifests/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - dcgm-exporter
+    networks:
+      - gpu-lab
+
+  # ---------------------------------------------------------------
+  # Grafana — GPU dashboards
+  # ---------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.3.1
+    container_name: gpu-lab-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/gpu-overview.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - gpu-lab
+
+  # ---------------------------------------------------------------
+  # Training workbench — PyTorch + CUDA base image for labs
+  # ---------------------------------------------------------------
+  training-workbench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gpu-lab-workbench
+    working_dir: /workspace
+    volumes:
+      - ./src:/workspace/src
+      - ./manifests:/workspace/manifests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MASTER_ADDR=localhost
+      - MASTER_PORT=29500
+      - WORLD_SIZE=1
+      - RANK=0
+    depends_on:
+      - kind-control-plane
+    networks:
+      - gpu-lab
+
+volumes:
+  kubeconfig:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  gpu-lab:
+    driver: bridge

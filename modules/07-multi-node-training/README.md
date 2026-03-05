@@ -1,4 +1,4 @@
-# Module 07: Multi-Node Distributed Training
+# Module 07: GPU Monitoring (nvidia-smi, DCGM, Prometheus)
 
 | | |
 |---|---|
@@ -12,38 +12,187 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Multi-Node Distributed Training
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Monitor GPU utilization, memory, temperature, and power using nvidia-smi and pynvml
+- Deploy DCGM Exporter to expose GPU metrics as Prometheus endpoints
+- Build Grafana dashboards for GPU cluster observability
+- Set up alerting rules for GPU health issues (thermal throttling, ECC errors, low utilization)
+- Use custom Python-based GPU monitoring with the pynvml library
+- Correlate GPU metrics with training performance (throughput, loss curves)
 
 ---
 
 ## Concepts
 
-### What is Multi-Node Distributed Training?
+### The GPU Monitoring Stack
 
-Multi-Node Distributed Training is a fundamental component of GPU Infrastructure on Kubernetes: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GPU Monitoring Stack                       │
+│                                                              │
+│  ┌───────────┐     ┌──────────────┐     ┌───────────────┐  │
+│  │ nvidia-smi│     │ DCGM Exporter│     │ Custom pynvml │  │
+│  │ (CLI tool)│     │ (DaemonSet)  │     │ (Python app)  │  │
+│  └─────┬─────┘     └──────┬───────┘     └──────┬────────┘  │
+│        │                   │                     │           │
+│        │ manual             │ :9400/metrics       │ :9400     │
+│        │                   │                     │           │
+│        │              ┌────▼─────────────────────▼────┐     │
+│        │              │         Prometheus              │     │
+│        │              │    (scrape + store + query)     │     │
+│        │              └────────────┬───────────────────┘     │
+│        │                           │                         │
+│        │              ┌────────────▼───────────────────┐     │
+│        │              │          Grafana                │     │
+│        │              │   (dashboards + alerts)         │     │
+│        │              └────────────────────────────────┘     │
+│        │                                                     │
+│        ▼                                                     │
+│   Interactive debugging     Production observability         │
+└─────────────────────────────────────────────────────────────┘
+```
 
-**Real-world analogy:** Think of Multi-Node Distributed Training like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+### nvidia-smi Deep Dive
 
-### Why Does This Matter?
+Beyond the basic dashboard, nvidia-smi offers powerful monitoring commands:
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```bash
+# Continuous monitoring (1-second interval)
+nvidia-smi dmon -s pucvmet -d 1
+# p=power, u=utilization, c=clocks, v=voltage, m=memory, e=ecc, t=temp
 
-### Key Terminology
+# Query specific metrics as CSV
+nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm,clocks.mem --format=csv -l 5
 
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+# Per-process GPU usage
+nvidia-smi pmon -s um -d 5
+# Shows which PID is using how much GPU compute and memory
+
+# GPU topology (critical for multi-GPU training)
+nvidia-smi topo -m
+
+# Check for ECC errors (hardware health)
+nvidia-smi --query-gpu=ecc.errors.corrected.volatile.total,ecc.errors.uncorrected.volatile.total --format=csv
+
+# MIG device information
+nvidia-smi mig -lgip    # List GPU Instance Profiles
+nvidia-smi mig -lgi     # List active GPU Instances
+```
+
+### DCGM (Data Center GPU Manager)
+
+DCGM is NVIDIA's enterprise GPU monitoring framework. The DCGM Exporter runs as a DaemonSet (deployed by GPU Operator) and exposes metrics in Prometheus format.
+
+**Key DCGM metrics:**
+
+| Metric | Prometheus Name | Description | Alert Threshold |
+|---|---|---|---|
+| GPU Utilization | `DCGM_FI_DEV_GPU_UTIL` | % of time SMs are active | < 20% = underutilized |
+| Memory Utilization | `DCGM_FI_DEV_MEM_COPY_UTIL` | % of memory bandwidth used | > 90% = memory pressure |
+| Memory Used | `DCGM_FI_DEV_FB_USED` | Framebuffer memory in MB | > 95% of total = OOM risk |
+| Temperature | `DCGM_FI_DEV_GPU_TEMP` | GPU junction temperature | > 83 C = thermal throttling |
+| Power Draw | `DCGM_FI_DEV_POWER_USAGE` | Current power in watts | > 95% of limit = thermal risk |
+| SM Clock | `DCGM_FI_DEV_SM_CLOCK` | SM frequency in MHz | Drop = thermal/power throttling |
+| ECC SBE | `DCGM_FI_DEV_ECC_SBE_VOL_TOTAL` | Single-bit ECC errors | > 0 = monitor trend |
+| ECC DBE | `DCGM_FI_DEV_ECC_DBE_VOL_TOTAL` | Double-bit ECC errors | > 0 = replace GPU |
+| PCIe TX/RX | `DCGM_FI_DEV_PCIE_TX_THROUGHPUT` | PCIe bandwidth in KB/s | Correlate with training speed |
+| NVLink TX/RX | `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink bandwidth | Low = communication bottleneck |
+| XID Errors | `DCGM_FI_DEV_XID_ERRORS` | GPU error code | Any XID = investigate |
+
+### Custom pynvml Monitoring
+
+For custom metrics or integration with your own services, use the pynvml Python library directly. See `src/monitoring/gpu_metrics.py` for a complete implementation.
+
+```python
+import pynvml
+
+pynvml.nvmlInit()
+handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+# Utilization
+util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+print(f"GPU: {util.gpu}%, Memory: {util.memory}%")
+
+# Memory
+mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+print(f"Used: {mem.used / 1e9:.1f} GB / {mem.total / 1e9:.1f} GB")
+
+# Temperature
+temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+print(f"Temp: {temp} C")
+
+# Power
+power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000  # mW -> W
+print(f"Power: {power:.0f} W")
+
+pynvml.nvmlShutdown()
+```
+
+### Prometheus Alerting Rules
+
+```yaml
+groups:
+  - name: gpu-alerts
+    rules:
+      # GPU is idle but allocated (wasting money)
+      - alert: GPUIdleButAllocated
+        expr: DCGM_FI_DEV_GPU_UTIL < 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu }} is idle ({{ $value }}% utilization)"
+
+      # Thermal throttling imminent
+      - alert: GPUThermalThrottling
+        expr: DCGM_FI_DEV_GPU_TEMP > 83
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU {{ $labels.gpu }} temperature {{ $value }}C (throttling threshold: 83C)"
+
+      # Memory nearly full (OOM risk)
+      - alert: GPUMemoryPressure
+        expr: (DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_FREE) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu }} memory at {{ $value }}%"
+
+      # ECC double-bit errors (hardware failure)
+      - alert: GPUECCDoubleBitError
+        expr: DCGM_FI_DEV_ECC_DBE_VOL_TOTAL > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU {{ $labels.gpu }} has double-bit ECC errors -- schedule replacement"
+
+      # XID errors (various GPU faults)
+      - alert: GPUXIDError
+        expr: DCGM_FI_DEV_XID_ERRORS > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu }} XID error {{ $value }}"
+```
+
+### Grafana Dashboard Panels
+
+A production GPU dashboard should include these panels:
+
+| Panel | Query | Visualization |
+|---|---|---|
+| GPU Utilization (all GPUs) | `DCGM_FI_DEV_GPU_UTIL` | Time series, stacked |
+| Memory Usage (per GPU) | `DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_FREE * 100` | Gauge (0-100%) |
+| Temperature (per GPU) | `DCGM_FI_DEV_GPU_TEMP` | Time series with threshold at 83 C |
+| Power Draw (per GPU) | `DCGM_FI_DEV_POWER_USAGE` | Time series |
+| SM Clock Speed | `DCGM_FI_DEV_SM_CLOCK` | Time series (drops indicate throttling) |
+| ECC Error Rate | `rate(DCGM_FI_DEV_ECC_SBE_VOL_TOTAL[5m])` | Counter |
+| PCIe Throughput | `DCGM_FI_DEV_PCIE_TX_THROUGHPUT` | Time series |
+| GPU Allocation | `kube_pod_resource_limit{resource="nvidia_com_gpu"}` | Table |
 
 ---
 
@@ -51,77 +200,104 @@ Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
 
 ### Prerequisites Check
 
-Before starting, verify your environment:
-
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
+# Verify DCGM Exporter is running
+kubectl get pods -n gpu-operator -l app=nvidia-dcgm-exporter
 
-# Check you have the project cloned
-ls modules/07-multi-node-training/
+# Check Prometheus can scrape GPU metrics
+kubectl port-forward -n gpu-operator svc/nvidia-dcgm-exporter 9400:9400 &
+curl -s http://localhost:9400/metrics | head -20
 ```
 
-### Exercise 1: Setup and Configuration
+### Exercise 1: Explore nvidia-smi Monitoring
 
-**Goal:** Get the foundation in place for this module.
+**Goal:** Master nvidia-smi for interactive GPU debugging.
 
-**Step 1:** Review the starter files
 ```bash
-ls modules/07-multi-node-training/lab/starter/
+# Start a GPU workload to generate utilization
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-stress
+spec:
+  restartPolicy: Never
+  containers:
+    - name: stress
+      image: nvcr.io/nvidia/cuda:12.3.1-base-ubuntu22.04
+      command: ["bash", "-c", "apt-get update && apt-get install -y gpu-burn && gpu_burn 120"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+EOF
+
+# Monitor in real-time
+nvidia-smi dmon -s pucvmet -d 1
+
+# CSV output for analysis
+nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv -l 2 > gpu_metrics.csv
 ```
 
-**Step 2:** Set up the required environment
+### Exercise 2: Run the Custom GPU Metrics Exporter
+
+**Goal:** Deploy the Python-based GPU metrics collector from `src/monitoring/gpu_metrics.py`.
+
 ```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/07-multi-node-training/lab/starter/
+# Run locally (if NVIDIA GPU is available)
+python src/monitoring/gpu_metrics.py
+
+# Or deploy on Kubernetes
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-metrics-exporter
+  labels:
+    app: gpu-metrics
+spec:
+  containers:
+    - name: exporter
+      image: python:3.11-slim
+      command: ["python", "/app/gpu_metrics.py"]
+      ports:
+        - containerPort: 9400
+      env:
+        - name: GPU_METRICS_PORT
+          value: "9400"
+        - name: GPU_METRICS_INTERVAL
+          value: "15"
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+EOF
 ```
 
-**Step 3:** Verify the setup
+### Exercise 3: Set Up Prometheus + Grafana GPU Dashboard
+
+**Goal:** Create a complete GPU monitoring pipeline.
+
 ```bash
-# Run the validation to check your setup
-bash modules/07-multi-node-training/validation/validate.sh
+# Start the monitoring stack
+docker compose up -d prometheus grafana dcgm-exporter
+
+# Access Grafana at http://localhost:3000 (admin/admin)
+# Add Prometheus data source: http://prometheus:9090
+# Import NVIDIA DCGM dashboard: ID 12239
 ```
-
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
 
 ---
 
-## Starter Files
+## Key Terminology
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+| Term | Definition |
+|---|---|
+| **DCGM** | Data Center GPU Manager -- NVIDIA's GPU monitoring and management framework |
+| **DCGM Exporter** | DaemonSet that exposes DCGM metrics in Prometheus format on port 9400 |
+| **pynvml** | Python bindings for NVML (NVIDIA Management Library) for programmatic GPU access |
+| **XID Error** | NVIDIA GPU error code indicating a hardware or driver fault |
+| **Thermal Throttling** | Automatic reduction of GPU clock speeds when temperature exceeds safe limits |
+| **ECC** | Error-Correcting Code -- detects and corrects memory bit errors |
+| **ServiceMonitor** | Prometheus Operator CRD that auto-discovers endpoints to scrape |
 
 ---
 
@@ -129,31 +305,31 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Not deploying DCGM Exporter | No GPU metrics in Prometheus | Ensure `dcgmExporter.enabled=true` in ClusterPolicy |
+| Missing ServiceMonitor | Prometheus doesn't scrape GPU metrics | Set `dcgmExporter.serviceMonitor.enabled=true` or create manually |
+| Alerting on instantaneous spikes | Alert fatigue from short GPU bursts | Set appropriate `for:` duration (5-15 minutes) |
+| Ignoring ECC errors | GPU failure during training | Alert on any double-bit ECC error immediately |
+| Not correlating GPU metrics with job metrics | Can't diagnose training slowdowns | Export training throughput as Prometheus metric |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of Multi-Node Distributed Training?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What is the difference between GPU utilization and memory utilization? Which is more important for diagnosing slow training?
+2. At what temperature does an NVIDIA GPU start thermal throttling? What are the consequences?
+3. Explain the monitoring stack: GPU hardware -> NVML -> DCGM -> Prometheus -> Grafana.
+4. What does a double-bit ECC error indicate? What action should you take?
+5. Your GPU shows 95% utilization but training is slow. What other metrics would you check?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/07-multi-node-training/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
+- [ ] You can use `nvidia-smi dmon` for real-time GPU monitoring
+- [ ] DCGM Exporter is deployed and Prometheus is scraping GPU metrics
+- [ ] You have a Grafana dashboard showing GPU utilization, memory, temperature, and power
+- [ ] Alerting rules are configured for thermal throttling, ECC errors, and idle GPUs
+- [ ] You understand the custom pynvml exporter code in `src/monitoring/gpu_metrics.py`
 - [ ] Self-check questions answered confidently
 
 ---
@@ -162,24 +338,28 @@ Test your understanding before moving on:
 
 ### Common Issues
 
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: DCGM Exporter returns empty metrics**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+kubectl logs -n gpu-operator -l app=nvidia-dcgm-exporter --tail=30
+# Common cause: DCGM cannot connect to the GPU driver
+# Fix: Ensure the NVIDIA driver is loaded and functional
+nvidia-smi  # On the host, verify driver works
 ```
 
-**Issue: Permission denied**
+**Issue: Prometheus not scraping DCGM metrics**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+# Check ServiceMonitor exists
+kubectl get servicemonitor -n gpu-operator
+
+# Verify Prometheus targets
+curl http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job == "dcgm-exporter")'
 ```
+
+**Issue: Grafana dashboard shows "No Data"**
+- Verify Prometheus data source is configured correctly in Grafana
+- Check time range (GPU metrics may not have been collected yet)
+- Run `curl http://localhost:9090/api/v1/query?query=DCGM_FI_DEV_GPU_UTIL` to verify data exists
 
 ---
 
-**Next: [Module 08 →](../08-monitoring-gpu-usage/)**
+**Next: [Module 08 - Cost Optimization](../08-monitoring-gpu-usage/)**

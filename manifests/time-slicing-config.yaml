@@ -1,0 +1,174 @@
+# GPU Time-Slicing Configuration
+# Allows multiple pods to share a single physical GPU using NVIDIA's
+# time-slicing feature. Each pod gets a "virtual" GPU that context-
+# switches with other pods on the same physical device.
+#
+# How it works:
+#   1. The NVIDIA device plugin advertises N replicas per physical GPU.
+#   2. Kubernetes scheduler treats each replica as a separate resource.
+#   3. At runtime, CUDA contexts time-slice on the physical GPU.
+#
+# Trade-offs:
+#   - No memory isolation between pods (unlike MIG).
+#   - Slight overhead from context switching (~5-10%).
+#   - Best for inference, interactive notebooks, dev/test workloads.
+#   - NOT recommended for large training jobs (use MIG or dedicated GPUs).
+#
+# Usage:
+#   kubectl apply -f manifests/time-slicing-config.yaml
+#   # Then restart the NVIDIA device plugin DaemonSet:
+#   kubectl rollout restart daemonset/nvidia-device-plugin-daemonset \
+#     -n gpu-operator
+# -------------------------------------------------------------------
+
+---
+# ConfigMap consumed by the NVIDIA device plugin
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator
+  labels:
+    app.kubernetes.io/part-of: gpu-operator
+    app.kubernetes.io/component: device-plugin
+data:
+  # "any" is the default profile applied to all GPUs.
+  # You can define multiple profiles and assign them per-node using
+  # node labels:  nvidia.com/device-plugin.config=<profile-name>
+  any: |
+    version: v1
+    flags:
+      migStrategy: none        # Disable MIG when using time-slicing
+    sharing:
+      timeSlicing:
+        renameByDefault: false  # Keep resource name as nvidia.com/gpu
+        failRequestsGreaterThanOne: false
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4        # Each physical GPU exposed as 4 virtual GPUs
+
+  # Profile for development nodes - more slices, lighter workloads
+  dev: |
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        renameByDefault: true   # Advertise as nvidia.com/gpu.shared
+        failRequestsGreaterThanOne: true
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 8         # 8 slices per GPU for dev workloads
+
+  # Profile for inference nodes
+  inference: |
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        renameByDefault: false
+        failRequestsGreaterThanOne: false
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
+
+---
+# Label nodes to select which time-slicing profile they use.
+# Apply with:  kubectl label node <node> nvidia.com/device-plugin.config=dev
+#
+# Example DaemonSet patch to pick up ConfigMap changes automatically:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: gpu-operator
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-device-plugin
+  template:
+    metadata:
+      labels:
+        app: nvidia-device-plugin
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.14.3
+          env:
+            - name: CONFIG_FILE
+              value: /config/any
+            - name: PASS_DEVICE_SPECS
+              value: "true"
+            - name: FAIL_ON_INIT_ERROR
+              value: "true"
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: config
+          configMap:
+            name: time-slicing-config
+
+---
+# Example pod requesting a time-sliced GPU
+apiVersion: v1
+kind: Pod
+metadata:
+  name: timeslice-test-pod
+  namespace: default
+  labels:
+    app: timeslice-test
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: cuda-sample
+      image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda12.3.1
+      args: ["-benchmark", "-numbodies=512000"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1    # Requests one time-sliced virtual GPU
+
+---
+# Pod that tests concurrent time-slicing (deploy multiples)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: timeslice-inference
+  namespace: default
+  labels:
+    app: timeslice-inference
+spec:
+  replicas: 4   # 4 pods sharing GPUs via time-slicing
+  selector:
+    matchLabels:
+      app: timeslice-inference
+  template:
+    metadata:
+      labels:
+        app: timeslice-inference
+    spec:
+      containers:
+        - name: inference
+          image: nvcr.io/nvidia/tritonserver:23.12-py3
+          args: ["tritonserver", "--model-repository=/models"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: grpc
+            - containerPort: 8002
+              name: metrics

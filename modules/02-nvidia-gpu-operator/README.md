@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Time** | 3-5 hours |
-| **Difficulty** | Beginner |
-| **Prerequisites** | Module 01 completed |
+| **Difficulty** | Beginner-Intermediate |
+| **Prerequisites** | Module 01 completed, kubectl and Helm installed |
 
 ---
 
@@ -12,38 +12,113 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of NVIDIA GPU Operator on Kubernetes
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Explain why the GPU Operator exists and what problems it solves
+- Deploy the NVIDIA GPU Operator on a Kubernetes cluster using Helm
+- Understand every component the operator manages (driver, toolkit, device plugin, DCGM, GFD, MIG manager)
+- Verify a working GPU Operator installation with validation pods
+- Troubleshoot common GPU Operator deployment failures
+- Configure the ClusterPolicy CRD for production environments
 
 ---
 
 ## Concepts
 
-### What is NVIDIA GPU Operator on Kubernetes?
+### The Problem: GPU Software Stack Complexity
 
-NVIDIA GPU Operator on Kubernetes is a fundamental component of GPU Infrastructure on Kubernetes: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+Running GPU workloads on Kubernetes requires a complex software stack on every node:
 
-**Real-world analogy:** Think of NVIDIA GPU Operator on Kubernetes like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+```
+Application (PyTorch, TensorFlow, Triton)
+        |
+   CUDA Libraries (cuDNN, cuBLAS, NCCL)
+        |
+   NVIDIA Container Toolkit (libnvidia-container)
+        |
+   NVIDIA Device Plugin for Kubernetes
+        |
+   NVIDIA Driver (kernel module)
+        |
+   GPU Hardware (A100, H100, etc.)
+```
 
-### Why Does This Matter?
+Without the GPU Operator, you must manually install and maintain:
+1. NVIDIA drivers on every GPU node
+2. NVIDIA Container Toolkit for GPU-aware containers
+3. Kubernetes device plugin DaemonSet for `nvidia.com/gpu` resource
+4. DCGM exporter for monitoring
+5. GPU Feature Discovery for node labels
+6. MIG Manager for partitioning
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+When you scale to 50+ GPU nodes across multiple Kubernetes clusters, manual management becomes impossible. Driver updates require rolling reboots, version mismatches cause silent failures, and new nodes need provisioning.
 
-### Key Terminology
+### The Solution: NVIDIA GPU Operator
 
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+The GPU Operator is a **Kubernetes Operator** that automates the entire NVIDIA software stack. You deploy one Helm chart, and it manages everything:
+
+```
+┌─────────────────────────────────────────────────┐
+│               NVIDIA GPU Operator                │
+│                                                   │
+│  ClusterPolicy CRD                               │
+│  ┌─────────────────────────────────────────────┐ │
+│  │  Driver Manager    → installs/updates driver │ │
+│  │  Toolkit          → container runtime hooks  │ │
+│  │  Device Plugin    → exposes nvidia.com/gpu   │ │
+│  │  DCGM Exporter    → Prometheus metrics       │ │
+│  │  GPU Feature Disc. → node labels             │ │
+│  │  MIG Manager      → MIG partitioning         │ │
+│  │  Validator        → health checks            │ │
+│  │  NFD              → Node Feature Discovery   │ │
+│  └─────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────┘
+```
+
+### GPU Operator Components in Detail
+
+| Component | What It Does | DaemonSet? | Why It Matters |
+|---|---|---|---|
+| **NVIDIA Driver** | Compiles and loads the GPU kernel module | Yes | Without it, the kernel cannot talk to the GPU |
+| **Container Toolkit** | Injects GPU device files and libraries into containers | Yes | Enables `--gpus all` in container runtimes |
+| **Device Plugin** | Registers `nvidia.com/gpu` as a schedulable Kubernetes resource | Yes | Without it, `kubectl` cannot schedule GPU pods |
+| **DCGM Exporter** | Exposes GPU metrics (utilization, memory, temp, ECC) as Prometheus metrics | Yes | Required for monitoring and alerting |
+| **GPU Feature Discovery (GFD)** | Labels nodes with GPU properties (`nvidia.com/gpu.product=A100`) | Yes | Enables nodeAffinity and nodeSelector for GPU-specific scheduling |
+| **MIG Manager** | Partitions A100/H100 GPUs into isolated MIG instances | Yes | Required for multi-tenant GPU sharing with isolation |
+| **Node Feature Discovery (NFD)** | Generic node labeling (CPU features, PCIe, etc.) | Yes | Foundation for GFD |
+| **Validator** | Runs smoke tests to confirm the GPU stack is healthy | Pod | Catches misconfiguration before workloads fail |
+
+### ClusterPolicy CRD
+
+The `ClusterPolicy` is the single source of truth for GPU Operator configuration. It controls which components are enabled, their versions, and runtime parameters.
+
+```yaml
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: cluster-policy
+spec:
+  driver:
+    enabled: true          # Set false if drivers are pre-installed
+    version: "545.23.08"
+  toolkit:
+    enabled: true
+  devicePlugin:
+    enabled: true
+    config:
+      name: time-slicing-config   # Reference to ConfigMap
+      default: any
+  dcgmExporter:
+    enabled: true
+    serviceMonitor:
+      enabled: true        # Auto-create Prometheus ServiceMonitor
+  migManager:
+    enabled: true
+    config:
+      name: mig-config     # Reference to MIG ConfigMap
+  gfd:
+    enabled: true
+  validator:
+    enabled: true
+```
 
 ---
 
@@ -51,77 +126,172 @@ Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
 
 ### Prerequisites Check
 
-Before starting, verify your environment:
-
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
+# Kubernetes cluster (kind, minikube, EKS, GKE, AKS)
+kubectl version --client
+kubectl get nodes
 
-# Check you have the project cloned
-ls modules/02-nvidia-gpu-operator/
+# Helm 3.x
+helm version
+
+# (Optional) Check for existing GPU resources
+kubectl get nodes -o json | jq '.items[].status.capacity'
 ```
 
-### Exercise 1: Setup and Configuration
+### Exercise 1: Deploy the GPU Operator
 
-**Goal:** Get the foundation in place for this module.
+**Goal:** Install the NVIDIA GPU Operator on your cluster.
 
-**Step 1:** Review the starter files
+**Step 1:** Add the NVIDIA Helm repository
 ```bash
-ls modules/02-nvidia-gpu-operator/lab/starter/
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
 ```
 
-**Step 2:** Set up the required environment
+**Step 2:** Create the namespace
 ```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/02-nvidia-gpu-operator/lab/starter/
+kubectl create namespace gpu-operator
 ```
 
-**Step 3:** Verify the setup
+**Step 3:** Install the GPU Operator
 ```bash
-# Run the validation to check your setup
-bash modules/02-nvidia-gpu-operator/validation/validate.sh
+helm install gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator \
+  --set driver.enabled=true \
+  --set toolkit.enabled=true \
+  --set devicePlugin.enabled=true \
+  --set dcgmExporter.enabled=true \
+  --set migManager.enabled=true \
+  --set gfd.enabled=true \
+  --set nfd.enabled=true \
+  --wait --timeout 10m
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+**Step 4:** Verify the installation
+```bash
+# All pods should be Running or Completed
+kubectl get pods -n gpu-operator
 
-### Exercise 2: Core Implementation
+# Check the ClusterPolicy status
+kubectl get clusterpolicy cluster-policy -o jsonpath='{.status.state}'
+# Expected: ready
 
-**Goal:** Implement the main concept of this module.
+# Verify GPU resources are advertised
+kubectl get nodes -o json | jq '.items[].status.allocatable | select(.["nvidia.com/gpu"])'
+```
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+### Exercise 2: Validate GPU Access
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+**Goal:** Confirm that GPU workloads can schedule and run.
 
-### Exercise 3: Integration and Testing
+**Step 1:** Deploy a GPU verification pod
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-verify
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: cuda-vectoradd
+      image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.3.1
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+EOF
+```
 
-**Goal:** Connect this module's work with the broader system.
+**Step 2:** Wait for completion and check logs
+```bash
+kubectl wait --for=condition=Ready pod/gpu-verify --timeout=120s
+kubectl logs gpu-verify
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+# Expected output includes: "Test PASSED"
+```
+
+**Step 3:** Inspect GPU node labels created by GFD
+```bash
+kubectl get node <your-node> -o json | jq '.metadata.labels | with_entries(select(.key | startswith("nvidia.com")))'
+```
+
+Example labels:
+```
+nvidia.com/gpu.product = NVIDIA-A100-SXM4-80GB
+nvidia.com/gpu.memory = 81920
+nvidia.com/gpu.count = 8
+nvidia.com/gpu.family = ampere
+nvidia.com/mig.capable = true
+nvidia.com/cuda.driver.major = 12
+```
+
+### Exercise 3: Customize the ClusterPolicy
+
+**Goal:** Modify the GPU Operator configuration for a production environment.
+
+**Step 1:** Export the current ClusterPolicy
+```bash
+kubectl get clusterpolicy cluster-policy -o yaml > cluster-policy-backup.yaml
+```
+
+**Step 2:** Apply custom settings via Helm upgrade
+```bash
+helm upgrade gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator \
+  --set devicePlugin.config.name=time-slicing-config \
+  --set dcgmExporter.serviceMonitor.enabled=true \
+  --set dcgmExporter.env[0].name=DCGM_EXPORTER_LISTEN \
+  --set dcgmExporter.env[0].value=":9400" \
+  --set validator.env[0].name=WITH_WORKLOAD \
+  --set validator.env[0].value="true" \
+  --wait --timeout 10m
+```
+
+**Step 3:** Verify the updated configuration
+```bash
+kubectl get clusterpolicy cluster-policy -o yaml | grep -A 5 "devicePlugin"
+kubectl get clusterpolicy cluster-policy -o yaml | grep -A 5 "dcgmExporter"
+```
 
 ---
 
-## Starter Files
+## Key Terminology
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
+| Term | Definition |
+|---|---|
+| **GPU Operator** | Kubernetes Operator that automates the NVIDIA GPU software stack lifecycle |
+| **ClusterPolicy** | Custom Resource (CRD) that configures all GPU Operator components |
+| **Device Plugin** | DaemonSet that registers `nvidia.com/gpu` as a Kubernetes extended resource |
+| **DCGM** | Data Center GPU Manager -- NVIDIA's low-level GPU monitoring framework |
+| **GFD** | GPU Feature Discovery -- labels nodes with GPU hardware properties |
+| **NFD** | Node Feature Discovery -- general-purpose node labeling framework |
+| **Container Toolkit** | Runtime hooks that inject GPU devices and libraries into containers |
 
-## Solution Files
+---
 
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
+## Architecture Reference
 
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+```
+                    ┌─────────────┐
+                    │  Helm Chart │
+                    └──────┬──────┘
+                           │ creates
+                    ┌──────▼──────┐
+                    │ ClusterPolicy│
+                    └──────┬──────┘
+                           │ reconciles
+              ┌────────────┼────────────┐
+              │            │            │
+        ┌─────▼─────┐ ┌───▼────┐ ┌────▼─────┐
+        │  DaemonSets│ │  Pods  │ │ConfigMaps│
+        └─────┬─────┘ └───┬────┘ └──────────┘
+              │            │
+    ┌─────────┼─────────┐  │
+    │         │         │  │
+┌───▼──┐ ┌───▼──┐ ┌───▼──┐ ┌──▼───┐
+│Driver│ │Plugin│ │ DCGM │ │Valid.│
+└──────┘ └──────┘ └──────┘ └──────┘
+```
 
 ---
 
@@ -129,31 +299,31 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Installing on nodes without GPUs | Driver pods CrashLoopBackOff | Use `nodeSelector` or `tolerations` to target only GPU nodes |
+| Driver version mismatch with host | `nvidia-smi` fails inside containers | Set `driver.enabled=false` if host has pre-installed drivers |
+| Missing containerd config | Device plugin cannot see GPUs | Ensure `toolkit.env` points to correct containerd socket path |
+| Not waiting for operator readiness | GPU pods stuck in Pending | Wait for `ClusterPolicy` status = `ready` before deploying workloads |
+| Forgetting ServiceMonitor for DCGM | No GPU metrics in Prometheus | Set `dcgmExporter.serviceMonitor.enabled=true` |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of NVIDIA GPU Operator on Kubernetes?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What problem does the GPU Operator solve that you cannot solve with manual installation?
+2. Name all seven components the GPU Operator manages. What happens if you disable the device plugin?
+3. What is the ClusterPolicy CRD and why is it the central configuration point?
+4. How do GFD labels enable GPU-specific scheduling? Give an example nodeSelector.
+5. Your GPU pods are stuck in Pending after installing the operator. What three things do you check first?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/02-nvidia-gpu-operator/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
+- [ ] GPU Operator is deployed and all pods are Running
+- [ ] ClusterPolicy status shows `ready`
+- [ ] A CUDA sample pod runs successfully and logs `Test PASSED`
+- [ ] You can list GPU node labels created by GFD
+- [ ] You understand every component and can explain why each is necessary
 - [ ] Self-check questions answered confidently
 
 ---
@@ -162,24 +332,29 @@ Test your understanding before moving on:
 
 ### Common Issues
 
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: Driver pod stuck in Init or CrashLoopBackOff**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+kubectl logs -n gpu-operator -l app=nvidia-driver-daemonset --tail=50
+# Common causes:
+# - Secure Boot enabled (disable or use pre-compiled drivers)
+# - Kernel headers not installed on host
+# - Incompatible driver version for your GPU
 ```
 
-**Issue: Permission denied**
+**Issue: Device plugin not registering GPU resources**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset --tail=50
+kubectl describe node <gpu-node> | grep -A5 "Allocatable"
+# Look for nvidia.com/gpu in the output
+```
+
+**Issue: DCGM exporter showing no metrics**
+```bash
+kubectl port-forward -n gpu-operator svc/nvidia-dcgm-exporter 9400:9400
+curl http://localhost:9400/metrics | head -20
+# If empty, check DCGM pod logs for NVML errors
 ```
 
 ---
 
-**Next: [Module 03 →](../03-gpu-sharing-strategies/)**
+**Next: [Module 03 - GPU Device Plugin and Scheduling](../03-gpu-sharing-strategies/)**

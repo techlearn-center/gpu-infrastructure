@@ -1,10 +1,10 @@
-# Module 04: GPU Time-Slicing
+# Module 04: Multi-Instance GPU (MIG) Partitioning
 
 | | |
 |---|---|
 | **Time** | 3-5 hours |
 | **Difficulty** | Intermediate |
-| **Prerequisites** | Module 03 completed |
+| **Prerequisites** | Module 03 completed, A100/A30/H100 GPU (or simulation) |
 
 ---
 
@@ -12,38 +12,102 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of GPU Time-Slicing
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Explain what MIG is, why it exists, and which GPUs support it
+- List MIG profiles for A100-80GB and calculate resource allocations
+- Configure the MIG Manager via ConfigMap and node labels
+- Choose between "single" and "mixed" MIG strategies
+- Deploy workloads that request specific MIG instances
+- Compare MIG vs. time-slicing vs. MPS for GPU sharing
 
 ---
 
 ## Concepts
 
-### What is GPU Time-Slicing?
+### What is MIG?
 
-GPU Time-Slicing is a fundamental component of GPU Infrastructure on Kubernetes: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+Multi-Instance GPU (MIG) is a hardware-level partitioning feature on NVIDIA A100, A30, and H100 GPUs. It divides a single physical GPU into up to 7 isolated **GPU Instances (GIs)**, each with:
 
-**Real-world analogy:** Think of GPU Time-Slicing like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+- **Dedicated streaming multiprocessors (SMs)** -- guaranteed compute
+- **Dedicated memory** -- isolated HBM with separate memory controllers
+- **Dedicated L2 cache** -- no cache thrashing between tenants
+- **Separate error isolation** -- an ECC error in one instance does not affect others
 
-### Why Does This Matter?
+```
+Physical A100-80GB GPU
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐              │
+│  │ 1g.10gb  │ │ 1g.10gb  │ │ 1g.10gb  │ │ 1g.10gb  │  ... x 7    │
+│  │ 1 SM     │ │ 1 SM     │ │ 1 SM     │ │ 1 SM     │              │
+│  │ 10 GB    │ │ 10 GB    │ │ 10 GB    │ │ 10 GB    │              │
+│  │ isolated │ │ isolated │ │ isolated │ │ isolated │              │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘              │
+│                                                                     │
+│  OR                                                                 │
+│                                                                     │
+│  ┌────────────────────┐ ┌────────────────────┐                     │
+│  │     3g.40gb        │ │     3g.40gb        │                     │
+│  │   3 SMs, 40 GB     │ │   3 SMs, 40 GB     │                     │
+│  │   isolated         │ │   isolated         │                     │
+│  └────────────────────┘ └────────────────────┘                     │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+### MIG Profiles (A100-80GB)
 
-### Key Terminology
+| Profile | SMs | Memory | L2 Cache | Max Instances | Use Case |
+|---|---|---|---|---|---|
+| **1g.10gb** | 1/7 | 10 GB | 1/7 | 7 | Small inference, CI/CD GPU tests |
+| **1g.10gb+me** | 1/7 | 10 GB + media | 1/7 | 1* | Video transcoding |
+| **2g.20gb** | 2/7 | 20 GB | 2/7 | 3 | Medium inference, fine-tuning small models |
+| **3g.40gb** | 3/7 | 40 GB | 3/7 | 2 | Training medium models, batch inference |
+| **4g.40gb** | 4/7 | 40 GB | 4/7 | 1 | Large training (with 3g.40gb on remaining SMs) |
+| **7g.80gb** | 7/7 | 80 GB | 7/7 | 1 | Full GPU (MIG disabled effectively) |
 
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+\*The `+me` profiles include the media engine for video decode/encode.
+
+### MIG Strategies: Single vs. Mixed
+
+| Strategy | Resource Name | How It Works | Best For |
+|---|---|---|---|
+| **single** | `nvidia.com/gpu` | All instances on a GPU use the same profile. Each instance appears as 1 GPU. | Homogeneous workloads (all inference, all training) |
+| **mixed** | `nvidia.com/mig-<profile>` | Different profiles coexist on one GPU. Pods request specific profiles. | Multi-tenant clusters with varied workload sizes |
+
+**Single strategy example:**
+```yaml
+# All 7 instances are 1g.10gb
+# Pod requests nvidia.com/gpu: 1  (gets one 1g.10gb instance)
+resources:
+  limits:
+    nvidia.com/gpu: 1
+```
+
+**Mixed strategy example:**
+```yaml
+# GPU has 1x 3g.40gb + 2x 1g.10gb
+# Pod requests a specific profile
+resources:
+  limits:
+    nvidia.com/mig-3g.40gb: 1    # Gets the 3g.40gb instance
+```
+
+### MIG vs. Time-Slicing vs. MPS
+
+| Feature | MIG | Time-Slicing | MPS |
+|---|---|---|---|
+| **Isolation** | Full (memory, compute, cache) | None (shared everything) | Partial (shared memory) |
+| **Memory protection** | Hardware-enforced | None | None |
+| **Supported GPUs** | A100, A30, H100 only | Any NVIDIA GPU | Any NVIDIA GPU |
+| **Max partitions** | 7 (A100) | Unlimited (software) | 48 clients |
+| **Overhead** | Near-zero | 5-10% context switch | 3-5% |
+| **Reconfiguration** | Requires draining pods | ConfigMap + restart | Dynamic |
+| **Best for** | Production multi-tenancy | Dev/test sharing | Inference serving |
+
+**Decision tree:**
+1. Need hard memory isolation? **Use MIG** (if GPU supports it)
+2. GPU does not support MIG? **Use time-slicing** for dev/test, **MPS** for inference
+3. Need maximum flexibility? **Use time-slicing** (any GPU, easy to reconfigure)
 
 ---
 
@@ -51,77 +115,113 @@ Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
 
 ### Prerequisites Check
 
-Before starting, verify your environment:
-
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
+# Verify MIG capability
+kubectl get nodes -o json | jq '.items[].metadata.labels["nvidia.com/mig.capable"]'
+# Should return "true" for A100/A30/H100 nodes
 
-# Check you have the project cloned
-ls modules/04-time-slicing/
+# Check current MIG status
+nvidia-smi mig -lgip    # List GPU Instance profiles
+nvidia-smi mig -lgi     # List active GPU Instances
 ```
 
-### Exercise 1: Setup and Configuration
+### Exercise 1: Enable MIG and Create Instances
 
-**Goal:** Get the foundation in place for this module.
+**Goal:** Enable MIG mode and partition a GPU.
 
-**Step 1:** Review the starter files
+**Step 1:** Enable MIG mode on a GPU (requires exclusive access)
 ```bash
-ls modules/04-time-slicing/lab/starter/
+# Enable MIG on GPU 0
+sudo nvidia-smi -i 0 -mig 1
+
+# Verify MIG is enabled
+nvidia-smi -i 0 --query-gpu=mig.mode.current --format=csv,noheader
+# Expected: Enabled
 ```
 
-**Step 2:** Set up the required environment
+**Step 2:** Create MIG instances
 ```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/04-time-slicing/lab/starter/
+# Create 7x 1g.10gb instances (A100-80GB)
+sudo nvidia-smi mig -i 0 -cgi 19,19,19,19,19,19,19 -C
+
+# List instances
+nvidia-smi mig -lgi
+nvidia-smi mig -lci
 ```
 
-**Step 3:** Verify the setup
+**Step 3:** Verify partitions
 ```bash
-# Run the validation to check your setup
-bash modules/04-time-slicing/validation/validate.sh
+nvidia-smi
+# You should see 7 MIG devices listed under the GPU
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+### Exercise 2: Configure MIG Manager on Kubernetes
 
-### Exercise 2: Core Implementation
+**Goal:** Use the GPU Operator's MIG Manager for declarative partitioning.
 
-**Goal:** Implement the main concept of this module.
+**Step 1:** Apply the MIG ConfigMap
+```bash
+kubectl apply -f manifests/mig-config.yaml
+```
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+**Step 2:** Label a node with the desired MIG profile
+```bash
+# Apply the "all-1g.10gb" profile
+kubectl label node <gpu-node> nvidia.com/mig.config=all-1g.10gb --overwrite
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+# The MIG Manager will:
+# 1. Drain GPU pods from the node
+# 2. Destroy existing MIG instances
+# 3. Create new instances matching the profile
+# 4. Un-cordon the node
+```
 
-### Exercise 3: Integration and Testing
+**Step 3:** Watch the MIG Manager reconfigure
+```bash
+kubectl logs -n gpu-operator -l app=nvidia-mig-manager -f
 
-**Goal:** Connect this module's work with the broader system.
+# Verify new GPU resources
+kubectl get node <gpu-node> -o json | jq '.status.allocatable | to_entries[] | select(.key | contains("nvidia"))'
+```
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+### Exercise 3: Deploy Workloads on MIG Instances
+
+**Goal:** Schedule pods that target specific MIG profiles.
+
+```bash
+# Deploy a small inference pod on a 1g.10gb instance
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mig-inference
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: inference
+      image: nvcr.io/nvidia/cuda:12.3.1-base-ubuntu22.04
+      command: ["nvidia-smi"]
+      resources:
+        limits:
+          nvidia.com/mig-1g.10gb: 1
+EOF
+
+kubectl logs mig-inference
+# The nvidia-smi output should show only the 1g.10gb partition
+```
 
 ---
 
-## Starter Files
+## Key Terminology
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+| Term | Definition |
+|---|---|
+| **MIG (Multi-Instance GPU)** | Hardware partitioning feature that splits one GPU into up to 7 isolated instances |
+| **GPU Instance (GI)** | A MIG partition with dedicated SMs and memory |
+| **Compute Instance (CI)** | A subdivision of a GI (usually 1:1 with GI) |
+| **MIG Profile** | Specification like `1g.10gb` defining SM count and memory for an instance |
+| **MIG Strategy** | `single` (homogeneous) or `mixed` (heterogeneous) profile assignment |
+| **MIG Manager** | GPU Operator component that declaratively manages MIG configurations |
 
 ---
 
@@ -129,31 +229,31 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Enabling MIG on a non-supported GPU (T4, V100) | Error: "MIG is not supported" | MIG requires A100, A30, or H100 |
+| Forgetting to drain pods before MIG reconfiguration | GPU reset fails | Let the MIG Manager handle draining, or drain manually first |
+| Using `nvidia.com/gpu` with mixed strategy | Pod gets wrong-sized instance | Use `nvidia.com/mig-<profile>` for mixed strategy |
+| Creating incompatible profile combinations | nvidia-smi error | Check valid profile combinations in NVIDIA documentation |
+| Not setting GFD's `MIG_STRATEGY` env var | Node labels incorrect | Set `gfd.env.GFD_MIG_STRATEGY=mixed` in ClusterPolicy |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of GPU Time-Slicing?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What makes MIG fundamentally different from time-slicing? Name three isolation guarantees.
+2. How many 1g.10gb instances can you create on an A100-80GB? What about 2g.20gb?
+3. When should you use the "single" vs. "mixed" MIG strategy?
+4. What happens to running pods when you change a node's MIG configuration?
+5. A team needs 5 isolated GPU partitions with at least 15 GB memory each. What MIG profile and GPU would you recommend?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/04-time-slicing/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
+- [ ] You can explain MIG isolation guarantees (compute, memory, cache, ECC)
+- [ ] You can list MIG profiles and their resource allocations for A100
+- [ ] You have configured the MIG Manager via ConfigMap and node labels
+- [ ] You can deploy pods targeting specific MIG instances
+- [ ] You can articulate when to use MIG vs. time-slicing vs. MPS
 - [ ] Self-check questions answered confidently
 
 ---
@@ -162,24 +262,32 @@ Test your understanding before moving on:
 
 ### Common Issues
 
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: "MIG mode change requires GPU reset"**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+# All GPU processes must be stopped first
+sudo fuser -v /dev/nvidia*         # Find processes using GPU
+sudo nvidia-smi -i 0 -r            # Reset GPU
+sudo nvidia-smi -i 0 -mig 1       # Then enable MIG
 ```
 
-**Issue: Permission denied**
+**Issue: MIG Manager not reconfiguring after label change**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+kubectl logs -n gpu-operator -l app=nvidia-mig-manager --tail=50
+# Common causes:
+# - Pods still running on the GPU (drain first)
+# - Invalid profile name in label
+# - ConfigMap not applied
+```
+
+**Issue: Pod requesting MIG resource stuck Pending**
+```bash
+# Check available MIG resources
+kubectl get node <gpu-node> -o json | jq '.status.allocatable | to_entries[] | select(.key | contains("mig"))'
+
+# Ensure GFD strategy matches
+kubectl get pods -n gpu-operator -l app=gpu-feature-discovery -o yaml | grep MIG_STRATEGY
 ```
 
 ---
 
-**Next: [Module 05 →](../05-cuda-container-toolkit/)**
+**Next: [Module 05 - Time-Slicing for Shared GPU Access](../05-cuda-container-toolkit/)**

@@ -1,10 +1,10 @@
-# Module 03: GPU Sharing and MIG
+# Module 03: GPU Device Plugin and Scheduling
 
 | | |
 |---|---|
 | **Time** | 3-5 hours |
-| **Difficulty** | Beginner |
-| **Prerequisites** | Module 02 completed |
+| **Difficulty** | Intermediate |
+| **Prerequisites** | Module 02 completed, GPU Operator running |
 
 ---
 
@@ -12,38 +12,187 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of GPU Sharing and MIG
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Explain how the Kubernetes device plugin framework exposes GPU resources
+- Configure GPU resource requests and limits in pod specs
+- Use nodeSelector and nodeAffinity for GPU-type-specific scheduling
+- Implement topology-aware scheduling for multi-GPU workloads
+- Set up ResourceQuotas and LimitRanges to govern GPU allocation per namespace
+- Understand the scheduling flow from pod creation to GPU binding
 
 ---
 
 ## Concepts
 
-### What is GPU Sharing and MIG?
+### How Kubernetes Discovers GPUs
 
-GPU Sharing and MIG is a fundamental component of GPU Infrastructure on Kubernetes: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+Kubernetes does not natively understand GPUs. The **device plugin framework** bridges this gap:
 
-**Real-world analogy:** Think of GPU Sharing and MIG like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Kubernetes Node                        │
+│                                                          │
+│  ┌──────────────┐    gRPC     ┌───────────────────────┐ │
+│  │  kubelet      │◄──────────►│ NVIDIA Device Plugin   │ │
+│  │               │            │                         │ │
+│  │ - Registers   │            │ - Enumerates GPUs       │ │
+│  │   nvidia.com/ │            │ - Health checks         │ │
+│  │   gpu         │            │ - Allocates on request  │ │
+│  └──────┬───────┘            └───────────┬─────────────┘ │
+│         │                                │               │
+│         │ reports to                     │ reads          │
+│         ▼                                ▼               │
+│  ┌──────────────┐              ┌─────────────────────┐  │
+│  │  API Server   │              │  nvidia-smi / NVML  │  │
+│  │  (node status)│              │  (GPU hardware)     │  │
+│  └──────────────┘              └─────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
 
-### Why Does This Matter?
+**Flow:**
+1. The NVIDIA Device Plugin DaemonSet runs on every GPU node.
+2. It enumerates GPUs via NVML and registers `nvidia.com/gpu` with kubelet over gRPC.
+3. Kubelet reports GPU capacity/allocatable to the API server.
+4. The scheduler can now place pods that request `nvidia.com/gpu`.
+5. When a pod is assigned to a node, kubelet tells the device plugin which GPU to allocate.
+6. The device plugin provides the container with the GPU device file and environment variables.
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+### GPU Resource Requests and Limits
 
-### Key Terminology
+In Kubernetes, GPUs are an **extended resource**. Unlike CPU and memory, they have special rules:
 
-| Term | Definition |
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 1    # Request exactly 1 GPU
+```
+
+**Important rules:**
+- You can only specify `limits`, not `requests` (they are always equal for extended resources).
+- GPUs are **not divisible** -- you request whole GPUs (1, 2, 4, etc.).
+- A pod requesting 0 GPUs will not have access to any GPU.
+- GPUs are **exclusive by default** -- no two pods share a GPU (unless time-slicing or MIG is configured).
+- If a node has 4 GPUs and 3 are allocated, only pods requesting 1 GPU can schedule.
+
+### Scheduling Flow
+
+```
+Pod Created               Scheduler                     Node
+    │                         │                           │
+    │  PodSpec:               │                           │
+    │  nvidia.com/gpu: 2      │                           │
+    ├────────────────────────►│                           │
+    │                         │  Filter: nodes with       │
+    │                         │  >= 2 available GPUs      │
+    │                         │                           │
+    │                         │  Score: prefer nodes with │
+    │                         │  matching topology,       │
+    │                         │  fewer allocated GPUs     │
+    │                         │                           │
+    │                         ├──────────────────────────►│
+    │                         │  Bind pod to node         │
+    │                         │                           │
+    │                         │              kubelet asks  │
+    │                         │              device plugin │
+    │                         │              for 2 GPUs    │
+    │                         │                           │
+    │                         │              Device plugin │
+    │                         │              returns GPU   │
+    │                         │              UUIDs + env   │
+```
+
+### Node Selectors and Affinity
+
+GPU Feature Discovery (from Module 02) labels nodes with hardware properties. Use these labels to schedule pods on specific GPU types.
+
+**nodeSelector (simple):**
+```yaml
+spec:
+  nodeSelector:
+    nvidia.com/gpu.product: "NVIDIA-A100-SXM4-80GB"
+```
+
+**nodeAffinity (advanced):**
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                  - "NVIDIA-A100-SXM4-80GB"
+                  - "NVIDIA-H100-SXM5-80GB"
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: nvidia.com/gpu.memory
+                operator: Gt
+                values:
+                  - "40000"   # Prefer GPUs with > 40 GB VRAM
+```
+
+### Topology-Aware Scheduling
+
+For multi-GPU training, GPU placement matters. Two GPUs connected via NVLink can communicate at 600 GB/s, while PCIe-connected GPUs are limited to 64 GB/s.
+
+```yaml
+spec:
+  # Topology Manager policy must be set on kubelet
+  # kubelet --topology-manager-policy=best-effort
+  containers:
+    - name: training
+      resources:
+        limits:
+          nvidia.com/gpu: 4    # Scheduler + Topology Manager
+                                # try to place all 4 on same NUMA/NVLink domain
+```
+
+**Kubelet Topology Manager policies:**
+| Policy | Behavior |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| `none` | No topology awareness (default) |
+| `best-effort` | Try to align GPUs on same NUMA node; schedule anyway if not possible |
+| `restricted` | Only schedule if GPUs can be aligned on same NUMA node |
+| `single-numa-node` | Strict: all resources must come from a single NUMA node |
+
+### ResourceQuotas and LimitRanges
+
+In multi-tenant clusters, control GPU allocation per namespace:
+
+```yaml
+# Limit total GPUs per namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gpu-quota
+  namespace: team-ml
+spec:
+  hard:
+    requests.nvidia.com/gpu: "8"     # Team gets max 8 GPUs
+    limits.nvidia.com/gpu: "8"
+    pods: "20"                        # Max 20 pods
+```
+
+```yaml
+# Default GPU request per container
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gpu-limits
+  namespace: team-ml
+spec:
+  limits:
+    - type: Container
+      default:
+        nvidia.com/gpu: "1"
+      defaultRequest:
+        nvidia.com/gpu: "1"
+      max:
+        nvidia.com/gpu: "4"          # No single container gets > 4 GPUs
+```
 
 ---
 
@@ -51,77 +200,151 @@ Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
 
 ### Prerequisites Check
 
-Before starting, verify your environment:
-
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
+# Verify GPU Operator is running
+kubectl get pods -n gpu-operator
+kubectl get clusterpolicy cluster-policy -o jsonpath='{.status.state}'
 
-# Check you have the project cloned
-ls modules/03-gpu-sharing-strategies/
+# Check available GPU resources
+kubectl get nodes -o custom-columns=NAME:.metadata.name,GPUs:.status.allocatable.nvidia\\.com/gpu
 ```
 
-### Exercise 1: Setup and Configuration
+### Exercise 1: Schedule GPU Workloads
 
-**Goal:** Get the foundation in place for this module.
+**Goal:** Deploy pods with GPU requests and observe scheduling behavior.
 
-**Step 1:** Review the starter files
+**Step 1:** Deploy a single-GPU pod
 ```bash
-ls modules/03-gpu-sharing-strategies/lab/starter/
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: single-gpu-pod
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: cuda-check
+      image: nvcr.io/nvidia/cuda:12.3.1-base-ubuntu22.04
+      command: ["nvidia-smi"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+EOF
+
+kubectl wait --for=condition=Ready pod/single-gpu-pod --timeout=60s
+kubectl logs single-gpu-pod
 ```
 
-**Step 2:** Set up the required environment
+**Step 2:** Deploy a multi-GPU pod
 ```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/03-gpu-sharing-strategies/lab/starter/
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-gpu-pod
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: cuda-check
+      image: nvcr.io/nvidia/cuda:12.3.1-base-ubuntu22.04
+      command: ["bash", "-c", "nvidia-smi -L && echo 'GPU count:' && nvidia-smi --query-gpu=index --format=csv,noheader | wc -l"]
+      resources:
+        limits:
+          nvidia.com/gpu: 2
+EOF
 ```
 
-**Step 3:** Verify the setup
+**Step 3:** Observe what happens when GPUs are exhausted
 ```bash
-# Run the validation to check your setup
-bash modules/03-gpu-sharing-strategies/validation/validate.sh
+# Try to schedule more GPUs than available
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: greedy-gpu-pod
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: cuda-check
+      image: nvcr.io/nvidia/cuda:12.3.1-base-ubuntu22.04
+      command: ["nvidia-smi"]
+      resources:
+        limits:
+          nvidia.com/gpu: 100
+EOF
+
+# This pod should stay Pending
+kubectl get pod greedy-gpu-pod
+kubectl describe pod greedy-gpu-pod | grep -A5 "Events"
+# Look for: "Insufficient nvidia.com/gpu"
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+### Exercise 2: GPU-Specific Scheduling with Labels
 
-### Exercise 2: Core Implementation
+**Goal:** Use GFD labels to target specific GPU types.
 
-**Goal:** Implement the main concept of this module.
+```bash
+# List GPU labels on your node
+kubectl get nodes -o json | jq '.items[].metadata.labels | to_entries[] | select(.key | startswith("nvidia.com"))'
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+# Deploy a pod that targets A100 GPUs only
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: a100-only-pod
+spec:
+  restartPolicy: OnFailure
+  nodeSelector:
+    nvidia.com/gpu.product: "NVIDIA-A100-SXM4-80GB"
+  containers:
+    - name: training
+      image: nvcr.io/nvidia/pytorch:23.12-py3
+      command: ["python", "-c", "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+EOF
+```
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+### Exercise 3: Set Up GPU Quotas
 
-### Exercise 3: Integration and Testing
+**Goal:** Implement namespace-level GPU quotas for multi-tenancy.
 
-**Goal:** Connect this module's work with the broader system.
+```bash
+# Create a namespace for a team
+kubectl create namespace team-data-science
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+# Apply a ResourceQuota
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gpu-quota
+  namespace: team-data-science
+spec:
+  hard:
+    requests.nvidia.com/gpu: "4"
+    limits.nvidia.com/gpu: "4"
+EOF
+
+# Verify the quota
+kubectl get resourcequota -n team-data-science
+kubectl describe resourcequota gpu-quota -n team-data-science
+```
 
 ---
 
-## Starter Files
+## Key Terminology
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+| Term | Definition |
+|---|---|
+| **Device Plugin** | gRPC server that registers extended resources (like GPUs) with kubelet |
+| **Extended Resource** | Non-native Kubernetes resource (e.g., `nvidia.com/gpu`) that is integer, non-divisible, and non-overcommittable |
+| **GFD Labels** | Node labels set by GPU Feature Discovery describing GPU hardware properties |
+| **Topology Manager** | Kubelet component that aligns resource allocation (CPU, memory, GPU) to NUMA topology |
+| **ResourceQuota** | Namespace-scoped limit on total resource consumption |
+| **LimitRange** | Namespace-scoped default and max resource limits per container |
 
 ---
 
@@ -129,31 +352,31 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Setting `requests` instead of `limits` for GPUs | Validation error or ignored | Extended resources only use `limits` (request = limit automatically) |
+| Requesting fractional GPUs (e.g., 0.5) | Pod rejected | GPUs are integers; use time-slicing (Module 05) for sharing |
+| Ignoring topology for multi-GPU pods | 50% slower training | Enable Topology Manager with `best-effort` or `restricted` policy |
+| No ResourceQuota on shared clusters | One team monopolizes all GPUs | Apply quotas per namespace |
+| Wrong GFD label in nodeSelector | Pod stuck Pending forever | Check actual labels with `kubectl get node -o json` |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of GPU Sharing and MIG?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. How does the NVIDIA device plugin communicate with kubelet? What protocol?
+2. Why can you only set `limits` (not `requests`) for `nvidia.com/gpu`?
+3. A node has 4 GPUs, 3 are allocated. Can a pod requesting 2 GPUs schedule on this node? Why?
+4. What is the difference between `nodeSelector` and `nodeAffinity`? When would you use each?
+5. How does the Topology Manager improve multi-GPU training performance?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/03-gpu-sharing-strategies/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
+- [ ] You can deploy pods with GPU resource limits and verify GPU access
+- [ ] You can use GFD labels with nodeSelector and nodeAffinity
+- [ ] You can explain the full scheduling flow from pod creation to GPU binding
+- [ ] You have configured ResourceQuotas and LimitRanges for GPU namespaces
+- [ ] You understand topology-aware scheduling and its performance implications
 - [ ] Self-check questions answered confidently
 
 ---
@@ -162,24 +385,31 @@ Test your understanding before moving on:
 
 ### Common Issues
 
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: Pod stuck in Pending with "Insufficient nvidia.com/gpu"**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+# Check allocatable GPUs on all nodes
+kubectl get nodes -o custom-columns=NAME:.metadata.name,GPUs:.status.allocatable.nvidia\\.com/gpu
+
+# Check what is currently consuming GPUs
+kubectl get pods --all-namespaces -o json | jq '.items[] | select(.spec.containers[].resources.limits["nvidia.com/gpu"] != null) | {name: .metadata.name, ns: .metadata.namespace, gpus: .spec.containers[].resources.limits["nvidia.com/gpu"]}'
 ```
 
-**Issue: Permission denied**
+**Issue: GPU not visible inside container**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+# Check NVIDIA_VISIBLE_DEVICES env var
+kubectl exec <pod> -- env | grep NVIDIA
+# Should show: NVIDIA_VISIBLE_DEVICES=<uuid>
+
+# Verify container runtime is configured for GPU passthrough
+kubectl exec <pod> -- nvidia-smi
+```
+
+**Issue: GFD labels missing from node**
+```bash
+kubectl get pods -n gpu-operator -l app=gpu-feature-discovery
+kubectl logs -n gpu-operator -l app=gpu-feature-discovery --tail=20
 ```
 
 ---
 
-**Next: [Module 04 →](../04-time-slicing/)**
+**Next: [Module 04 - Multi-Instance GPU (MIG)](../04-time-slicing/)**

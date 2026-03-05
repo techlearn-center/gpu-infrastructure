@@ -1,0 +1,204 @@
+# NVIDIA GPU Operator - Kubernetes Deployment Manifest
+# Automates the management of all NVIDIA software components needed
+# to provision and monitor GPUs in a Kubernetes cluster.
+#
+# Prerequisites:
+#   - Kubernetes 1.25+
+#   - Helm 3.x (for initial operator install)
+#   - Nodes with NVIDIA GPUs attached
+#
+# Usage:
+#   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+#   helm repo update
+#   helm install gpu-operator nvidia/gpu-operator \
+#     --namespace gpu-operator --create-namespace \
+#     -f manifests/gpu-operator.yaml
+# -------------------------------------------------------------------
+
+---
+# Namespace for all GPU Operator components
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-operator
+  labels:
+    app.kubernetes.io/part-of: gpu-operator
+    pod-security.kubernetes.io/enforce: privileged
+
+---
+# ClusterPolicy - the primary CRD that tells the GPU Operator
+# which components to deploy and how to configure them.
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: cluster-policy
+spec:
+  # --- NVIDIA Driver ---------------------------------------------------
+  operator:
+    defaultRuntime: containerd
+    initContainer:
+      image: nvcr.io/nvidia/cuda
+      version: "12.3.1-base-ubuntu22.04"
+  driver:
+    enabled: true
+    version: "545.23.08"
+    repository: nvcr.io/nvidia
+    image: driver
+    manager:
+      env:
+        - name: ENABLE_GPU_DIRECT_RDMA
+          value: "true"
+    # Use pre-installed drivers on cloud VMs (GKE, EKS, AKS)
+    # Set to false if drivers are already on the host.
+    usePrecompiled: false
+    licensingConfig:
+      configMapName: ""
+
+  # --- NVIDIA Container Toolkit ----------------------------------------
+  toolkit:
+    enabled: true
+    version: "v1.14.4-ubuntu20.04"
+    env:
+      - name: CONTAINERD_CONFIG
+        value: /etc/containerd/config.toml
+      - name: CONTAINERD_SOCKET
+        value: /run/containerd/containerd.sock
+
+  # --- Device Plugin ---------------------------------------------------
+  devicePlugin:
+    enabled: true
+    version: "v0.14.3"
+    env:
+      - name: PASS_DEVICE_SPECS
+        value: "true"
+      - name: FAIL_ON_INIT_ERROR
+        value: "true"
+      - name: DEVICE_LIST_STRATEGY
+        value: envvar          # envvar | volume-mounts
+      - name: DEVICE_ID_STRATEGY
+        value: uuid            # uuid | index
+      - name: NVIDIA_MPS
+        value: "false"
+    # Time-slicing configuration (reference ConfigMap separately)
+    config:
+      name: time-slicing-config   # See time-slicing-config.yaml
+      default: any
+
+  # --- DCGM & DCGM Exporter (Monitoring) ------------------------------
+  dcgm:
+    enabled: true
+    version: "3.3.0-1-ubuntu22.04"
+  dcgmExporter:
+    enabled: true
+    version: "3.3.0-3.2.0-ubuntu22.04"
+    env:
+      - name: DCGM_EXPORTER_LISTEN
+        value: ":9400"
+      - name: DCGM_EXPORTER_KUBERNETES
+        value: "true"
+      - name: DCGM_EXPORTER_COLLECTORS
+        value: /etc/dcgm-exporter/dcp-metrics-included.csv
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+      honorLabels: false
+      additionalLabels:
+        monitoring: gpu
+
+  # --- GFD (GPU Feature Discovery) ------------------------------------
+  gfd:
+    enabled: true
+    version: "v0.8.2"
+    env:
+      - name: GFD_SLEEP_INTERVAL
+        value: "60s"
+      - name: GFD_MIG_STRATEGY
+        value: "mixed"    # none | single | mixed
+
+  # --- MIG Manager -----------------------------------------------------
+  migManager:
+    enabled: true
+    version: "v0.6.0-ubuntu20.04"
+    env:
+      - name: WITH_REBOOT
+        value: "false"
+    config:
+      name: mig-config    # See mig-config.yaml
+
+  # --- Node Feature Discovery ------------------------------------------
+  nfd:
+    enabled: true
+
+  # --- Validator -------------------------------------------------------
+  validator:
+    enabled: true
+    version: "v23.9.1"
+    env:
+      - name: WITH_WORKLOAD
+        value: "true"
+
+---
+# ServiceMonitor for Prometheus Operator to scrape GPU metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: gpu-operator
+  labels:
+    app: dcgm-exporter
+    monitoring: gpu
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+  endpoints:
+    - port: gpu-metrics
+      interval: 15s
+      path: /metrics
+
+---
+# ResourceQuota to limit GPU consumption per namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gpu-quota
+  namespace: default
+spec:
+  hard:
+    requests.nvidia.com/gpu: "4"
+    limits.nvidia.com/gpu: "4"
+
+---
+# LimitRange for default GPU requests
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gpu-limit-range
+  namespace: default
+spec:
+  limits:
+    - type: Container
+      default:
+        nvidia.com/gpu: "1"
+      defaultRequest:
+        nvidia.com/gpu: "1"
+      max:
+        nvidia.com/gpu: "4"
+
+---
+# Example workload - GPU verification pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-operator-verify
+  namespace: default
+  labels:
+    app: gpu-verify
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: cuda-vector-add
+      image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.3.1
+      resources:
+        limits:
+          nvidia.com/gpu: 1
